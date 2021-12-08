@@ -1,13 +1,11 @@
-use std::{
-    ffi::{CStr, CString},
-    process::exit,
-};
+use std::{ffi::CString, process::exit};
 
 use libc::fork;
 
 use crate::debugger::Debugger;
 
 pub mod breakpoint;
+pub mod command;
 pub mod debugger;
 
 fn main() {
@@ -27,8 +25,8 @@ fn main() {
         } else if pid >= 1 {
             println!("starting debugger process");
             let mut debugger = Debugger::new(prog, pid);
-            
 
+            debugger.wait_for_signal();
             debugger.run();
         }
     }
