@@ -1,35 +1,47 @@
+use std::{
+    ffi::{CStr, CString},
+    process::exit,
+};
+
+use libc::fork;
+
+use crate::debugger::Debugger;
+
 pub mod breakpoint;
 pub mod debugger;
 
-use rustyline::error::ReadlineError;
-use rustyline::Editor;
-
 fn main() {
-    // `()` can be used when no completer is required
-    let mut rl = Editor::<()>::new();
-    if rl.load_history(".gdbrs.history").is_err() {
-        println!("No previous history.");
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        println!("no program specified");
+        exit(1);
     }
-    loop {
-        let readline = rl.readline("minidbg>> ");
-        match readline {
-            Ok(line) => {
-                rl.add_history_entry(line.as_str());
-                println!("Line: {}", line);
-            },
-            Err(ReadlineError::Interrupted) => {
-                println!("CTRL-C");
-                break
-            },
-            Err(ReadlineError::Eof) => {
-                println!("CTRL-D");
-                break
-            },
-            Err(err) => {
-                println!("Error: {:?}", err);
-                break
-            }
+
+    let prog = args[1].clone();
+
+    unsafe {
+        let pid = fork();
+        if pid == 0 {
+            libc::personality(libc::ADDR_NO_RANDOMIZE as libc::c_ulong);
+            execute_debuggee(&prog);
+        } else if pid >= 1 {
+            println!("starting debugger process");
+            let mut debugger = Debugger::new(prog, pid);
+            
+
+            debugger.run();
         }
     }
-    rl.save_history(".gdbrs.history").unwrap();
+}
+
+unsafe fn execute_debuggee(prog: &str) {
+    let r = libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0);
+    if r < 0 {
+        println!("error in ptrace");
+    }
+
+    dbg!(r);
+
+    let prog_ctr = CString::new(prog).unwrap();
+    libc::execl(prog_ctr.as_ptr(), prog_ctr.as_ptr(), 0);
 }
