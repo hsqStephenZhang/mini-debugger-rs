@@ -2,14 +2,14 @@ use libc::pid_t;
 
 #[derive(Clone, Debug)]
 pub struct BreakPoint {
-    pub pid: pid_t,
-    pub addr: usize,
-    pub enabled: bool,
-    pub saved_data: i64,
+    pub(crate) pid: pid_t,
+    pub(crate) addr: u64,
+    pub(crate) enabled: bool,
+    pub(crate) saved_data: i64,
 }
 
 impl BreakPoint {
-    pub fn new(pid: pid_t, addr: usize) -> Self {
+    pub fn new(pid: pid_t, addr: u64) -> Self {
         Self {
             pid,
             addr,
@@ -19,21 +19,43 @@ impl BreakPoint {
     }
 
     pub fn enable(&mut self) {
-        unsafe {
-            let data = libc::ptrace(libc::PTRACE_PEEKDATA, self.pid, self.addr, 0);
-            self.saved_data = data;
-            let data_with_int3 = (data & !0xff) | 0xcc; // set the lower byte into 0xcc
-            libc::ptrace(libc::PTRACE_POKEDATA, self.pid, self.addr, data_with_int3);
+        if !self.enabled {
+            unsafe {
+                let data = libc::ptrace(libc::PTRACE_PEEKDATA, self.pid, self.addr, 0);
+                let bytes=data.to_ne_bytes();
+                self.saved_data = data;
+                println!(
+                    "raw data of i64:{:x?}, u8 array format:{:x?}",
+                    data,
+                    bytes
+                );
+                let data_with_int3 = (data & !0xff) | 0xcc; // set the lower byte into 0xcc
+                libc::ptrace(libc::PTRACE_POKEDATA, self.pid, self.addr, data_with_int3);
+            }
+            self.enabled = true;
+        }else {
+            println!("this breakpoint is enabled");
         }
-        self.enabled = true;
     }
 
     pub fn disable(&mut self) {
-        unsafe {
-            let data = libc::ptrace(libc::PTRACE_PEEKDATA, self.pid, self.addr, 0);
-            let restored_data = (data & !0xff) | self.saved_data; // put the low and high part together
-            libc::ptrace(libc::PTRACE_POKEDATA, self.pid, self.addr, restored_data);
+        if self.enabled {
+            unsafe {
+                let data = libc::ptrace(libc::PTRACE_PEEKDATA, self.pid, self.addr, 0);
+                let restored_data = (data & !0xff) | self.saved_data; // put the low and high part together
+                libc::ptrace(libc::PTRACE_POKEDATA, self.pid, self.addr, restored_data);
+            }
+            self.enabled = false;
+        }else{
+            println!("this breakpoint is disabled");
         }
-        self.enabled = false;
+    }
+}
+
+impl Drop for BreakPoint {
+    fn drop(&mut self) {
+        if self.enabled {
+            self.disable();
+        }
     }
 }
