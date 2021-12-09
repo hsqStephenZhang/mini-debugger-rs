@@ -22,18 +22,14 @@ impl BreakPoint {
         if !self.enabled {
             unsafe {
                 let data = libc::ptrace(libc::PTRACE_PEEKDATA, self.pid, self.addr, 0);
-                let bytes=data.to_ne_bytes();
+                let bytes = data.to_ne_bytes();
                 self.saved_data = data;
-                println!(
-                    "raw data of i64:{:x?}, u8 array format:{:x?}",
-                    data,
-                    bytes
-                );
+                println!("raw data: {:x?}", bytes);
                 let data_with_int3 = (data & !0xff) | 0xcc; // set the lower byte into 0xcc
                 libc::ptrace(libc::PTRACE_POKEDATA, self.pid, self.addr, data_with_int3);
             }
             self.enabled = true;
-        }else {
+        } else {
             println!("this breakpoint is enabled");
         }
     }
@@ -43,19 +39,16 @@ impl BreakPoint {
             unsafe {
                 let data = libc::ptrace(libc::PTRACE_PEEKDATA, self.pid, self.addr, 0);
                 let restored_data = (data & !0xff) | self.saved_data; // put the low and high part together
+                println!(
+                    "to be restored data: {:x?}",
+                    restored_data.to_ne_bytes()
+                );
                 libc::ptrace(libc::PTRACE_POKEDATA, self.pid, self.addr, restored_data);
             }
             self.enabled = false;
-        }else{
+        } else {
             println!("this breakpoint is disabled");
         }
     }
 }
 
-impl Drop for BreakPoint {
-    fn drop(&mut self) {
-        if self.enabled {
-            self.disable();
-        }
-    }
-}

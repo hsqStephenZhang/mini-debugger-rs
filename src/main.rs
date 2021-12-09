@@ -27,8 +27,10 @@ fn main() {
             println!("starting debugger process");
             let mut debugger = Debugger::new(prog, pid);
 
-            debugger.wait_for_signal();
-            debugger.run();
+            match debugger.wait_for_signal() {
+                Ok(_) => debugger.run(),
+                Err(e) => println!("error:{:?}", e),
+            }
         }
     }
 }

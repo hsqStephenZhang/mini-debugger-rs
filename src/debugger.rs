@@ -4,12 +4,14 @@ use std::{
     io::{self, BufRead},
 };
 
-use libc::{pid_t, ptrace};
+use libc::{pid_t, ptrace, siginfo_t};
+use nix::{errno::Errno, unistd::Pid};
 use rustyline::{error::ReadlineError, Editor};
 
 use crate::{
     breakpoint::BreakPoint,
-    command::{Gdb, Info, Memory}, utils::{str_to_u64, str_to_usize},
+    command::{Gdb, Info, Memory},
+    utils::{str_to_u64, str_to_usize},
 };
 
 pub const TRAP_BRKPT: i32 = 1; /* process breakpoint */
@@ -18,6 +20,7 @@ pub const TRAP_BRANCH: i32 = 3; /* process taken branch trap */
 pub const TRAP_HWBKPT: i32 = 4; /* hardware breakpoint/watchpoint */
 pub const TRAP_UNK: i32 = 5; /* undiagnosed trap */
 pub const TRAP_PERF: i32 = 6; /* perf event with sigtrap=1 */
+pub const SI_KERNEL: i32 = 0x80; /* kernel signal */
 
 #[derive(Clone, Debug)]
 pub enum State {
@@ -58,6 +61,11 @@ impl Debugger {
             index_to_breakpoints: HashMap::new(),
             next_breakpoint_index: 0,
         }
+    }
+
+    pub fn set_state(&mut self, state: State) {
+        let s = &mut self.state;
+        *s = state;
     }
 
     pub fn initialize_load_addr(&mut self) {
@@ -106,11 +114,6 @@ impl Debugger {
         }
     }
 
-    pub fn dump_registers(&self) {
-        let registers = self.get_registers();
-        println!("registers:\n{:?}", registers);
-    }
-
     pub fn name_to_register<'a>(
         &self,
         registers: &'a mut libc::user_regs_struct,
@@ -146,6 +149,11 @@ impl Debugger {
             "gs" => Some(&mut registers.gs),
             _ => None,
         };
+    }
+
+    pub fn dump_registers(&self) {
+        let registers = self.get_registers();
+        println!("registers:\n{:?}", registers);
     }
 
     pub fn dump_register(&self, name: &str) {
@@ -223,20 +231,18 @@ impl Debugger {
         todo!()
     }
 
-    pub fn continue_exec(&mut self) {
-        // ptrace continue can let the tracee continue to run
-        unsafe {
-            self.step_over_breakpoint();
-            libc::ptrace(libc::PTRACE_CONT, self.prog_pid, 0, 0);
-            dbg!(self.wait_signal_info());
-        }
-    }
-
+    // if there is a breakpoint at this point, we will:
+    //      1. disable the breakpoint, restore the instruction
+    //      2. ptrace single step, execute this instruction, after it, will trigger sigtrap
+    //      3. waitpid, handle the sigtrap
+    //      4. enable the breakpoint
     pub fn step_over_breakpoint(&mut self) {
-        let breakpoint_addr = self.get_pc() - 1;
+        let breakpoint_addr = self.get_pc();
+        dbg!(breakpoint_addr, &self.breakpoints);
         let breakpoint = self.breakpoints.get_mut(&breakpoint_addr);
         match breakpoint {
             Some(b) => {
+                println!("step over breakpoint, breakpoint:{:?}", b);
                 let ptr = b as *mut BreakPoint;
                 if b.enabled {
                     b.disable();
@@ -248,7 +254,19 @@ impl Debugger {
                     }
                 }
             }
-            None => {}
+            None => {
+                println!("no breakpoint!!!!!");
+            }
+        }
+    }
+
+    pub fn continue_exec(&mut self) -> Result<(), Errno> {
+        // ptrace continue can let the tracee continue to run
+        unsafe {
+            self.step_over_breakpoint();
+            libc::ptrace(libc::PTRACE_CONT, self.prog_pid, 0, 0);
+            self.wait_for_signal()?;
+            return Ok(());
         }
     }
 
@@ -262,7 +280,9 @@ impl Debugger {
 
         match parsed {
             Ok(gdb) => match gdb {
-                Gdb::Continue => self.continue_exec(),
+                Gdb::Continue => {
+                    self.handle_continue();
+                }
                 Gdb::Break { addr } => {
                     self.handle_breakpoint(addr);
                 }
@@ -275,6 +295,18 @@ impl Debugger {
             },
             Err(e) => {
                 println!("error:{:}", e);
+            }
+        }
+    }
+
+    pub fn handle_continue(&mut self) {
+        if let Err(err) = self.continue_exec() {
+            match err {
+                Errno::ESRCH => {
+                    println!("process dead: {}", self.prog_pid);
+                    self.set_state(State::Closed);
+                }
+                _ => {}
             }
         }
     }
@@ -376,16 +408,17 @@ impl Debugger {
         }
     }
 
-    pub fn handle_sigtrap(&mut self, info: i32) {
-        match info {
-            TRAP_BRKPT => {
-                let current_pc = self.get_pc();
+    pub fn handle_sigtrap(&mut self, info: siginfo_t) {
+        let registers = dbg!(self.get_registers());
+        match info.si_code {
+            TRAP_BRKPT | SI_KERNEL => {
+                let current_pc = registers.rip;
                 self.set_pc(current_pc - 1);
                 println!("Hit breakpoint at address: {:?}", current_pc);
             }
             TRAP_TRACE => {}
             _ => {
-                println!("unimplemented of sigtrap code:{}", info);
+                println!("unimplemented of sigtrap code: {:?}", info);
             }
         }
     }
@@ -405,37 +438,30 @@ impl Debugger {
     }
 
     // signal handle at the very beginning
-    pub fn wait_for_signal(&mut self) {
+    pub fn wait_for_signal(&mut self) -> Result<(), Errno> {
         unsafe {
-            dbg!(self.wait_signal_info());
-            let info = dbg!(self.get_signal_info());
+            self.wait_signal_info();
+            let info = self.get_signal_info()?;
 
-            match info {
+            match info.si_signo {
                 libc::SIGTRAP => {
                     self.handle_sigtrap(info);
                 }
                 libc::SIGSEGV => {
-                    println!("catch segfault. Reason: {}", info);
+                    println!("catch segfault. Reason: {:?}", info);
                 }
                 _ => {
-                    println!("get signal {}", info);
+                    println!("get signal {:?}", info);
                 }
             }
+
+            return Ok(());
         }
     }
 
-    pub fn get_signal_info(&self) -> i32 {
-        unsafe {
-            let mut info = 0;
-            libc::ptrace(
-                libc::PTRACE_GETSIGINFO,
-                self.prog_pid,
-                0,
-                &mut info as *mut _ as *mut libc::c_void,
-            );
-
-            info
-        }
+    pub fn get_signal_info(&self) -> Result<siginfo_t, Errno> {
+        let pid = Pid::from_raw(self.prog_pid);
+        nix::sys::ptrace::getsiginfo(pid)
     }
 
     pub fn wait_signal_info(&self) -> i32 {
