@@ -7,6 +7,13 @@ pub fn str_to_usize(s: &str) -> Result<usize, &str> {
     }
 }
 
-pub fn i64_to_u8s(value: i64) -> [u8; 8] {
-    unsafe { std::mem::transmute(value) }
+pub fn str_to_u64(s: &str) -> Result<u64, &str> {
+    if s.starts_with("0x") {
+        let real = &s[2..];
+        return u64::from_str_radix(real, 16).map_err(|_e| real);
+    } else {
+        return s.parse::<u64>().map_err(|_e| s);
+    }
 }
+
+

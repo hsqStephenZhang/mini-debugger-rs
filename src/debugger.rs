@@ -1,13 +1,23 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{self, BufRead},
+};
 
 use libc::{pid_t, ptrace};
 use rustyline::{error::ReadlineError, Editor};
 
 use crate::{
     breakpoint::BreakPoint,
-    command::{Gdb, Info, Memory},
-    utils::str_to_usize,
+    command::{Gdb, Info, Memory}, utils::{str_to_u64, str_to_usize},
 };
+
+pub const TRAP_BRKPT: i32 = 1; /* process breakpoint */
+pub const TRAP_TRACE: i32 = 2; /* process trace trap */
+pub const TRAP_BRANCH: i32 = 3; /* process taken branch trap */
+pub const TRAP_HWBKPT: i32 = 4; /* hardware breakpoint/watchpoint */
+pub const TRAP_UNK: i32 = 5; /* undiagnosed trap */
+pub const TRAP_PERF: i32 = 6; /* perf event with sigtrap=1 */
 
 #[derive(Clone, Debug)]
 pub enum State {
@@ -30,8 +40,8 @@ pub struct Debugger {
     pub prog_name: String,
     pub prog_pid: pid_t,
     pub load_addr: usize,
-    pub breakpoints: HashMap<usize, BreakPoint>,
-    pub index_to_breakpoints: HashMap<usize, usize>,
+    pub breakpoints: HashMap<u64, BreakPoint>,
+    pub index_to_breakpoints: HashMap<usize, u64>,
     pub next_breakpoint_index: usize,
 }
 
@@ -50,7 +60,19 @@ impl Debugger {
         }
     }
 
-    pub fn set_breakpointer_at_address(&mut self, addr: usize) {
+    pub fn initialize_load_addr(&mut self) {
+        let proc_maps = format!("/proc/{}/maps", self.prog_pid);
+        let file = File::open(proc_maps).unwrap();
+        let mut iter = io::BufReader::new(file).lines();
+        let first_line = iter.next().unwrap().unwrap();
+        let items = first_line.splitn(2, '-').collect::<Vec<_>>();
+        let base_addr = items[0];
+        let addr = usize::from_str_radix(base_addr, 16).unwrap();
+        self.load_addr = addr;
+        println!("load addr:{:x?}", self.load_addr);
+    }
+
+    pub fn set_breakpointer_at_address(&mut self, addr: u64) {
         let mut breakpoint = BreakPoint::new(self.prog_pid, addr);
         breakpoint.enable();
         self.breakpoints.insert(addr, breakpoint);
@@ -131,10 +153,40 @@ impl Debugger {
         let register = self.name_to_register(&mut registers, name);
         match register {
             Some(r) => {
-                println!("register name: {}, register value{:x}", name, r);
+                println!("{} : {:x}", name, r);
             }
             None => println!("register name not found:{}", name),
         }
+    }
+
+    pub fn set_register(&self, name: &str, value: u64) {
+        let mut registers = self.get_registers();
+        match self.name_to_register(&mut registers, name) {
+            Some(r) => {
+                *r = value;
+                self.set_registers(registers);
+            }
+            None => {
+                println!("register name not found:{}", name);
+            }
+        }
+    }
+
+    pub fn set_registers(&self, mut registers: libc::user_regs_struct) {
+        let p = &mut registers as *mut _ as *mut libc::c_void;
+        unsafe {
+            ptrace(libc::PTRACE_SETREGS, self.prog_pid, 0, p);
+        }
+    }
+
+    pub fn get_pc(&self) -> u64 {
+        self.get_registers().rip
+    }
+
+    pub fn set_pc(&self, pc: u64) {
+        let mut registers = self.get_registers();
+        registers.rip = pc;
+        self.set_registers(registers);
     }
 
     pub fn print_backtrace(&self) {
@@ -174,25 +226,30 @@ impl Debugger {
     pub fn continue_exec(&mut self) {
         // ptrace continue can let the tracee continue to run
         unsafe {
+            self.step_over_breakpoint();
             libc::ptrace(libc::PTRACE_CONT, self.prog_pid, 0, 0);
-
-            let mut wait_status = 0;
-            let option = 0;
-            libc::waitpid(self.prog_pid, &mut wait_status as _, option);
-            dbg!(wait_status);
+            dbg!(self.wait_signal_info());
         }
     }
 
-    pub fn get_pc(&self) {
-        todo!()
-    }
-
-    pub fn set_pc(&self, pc: usize) {
-        todo!()
-    }
-
-    pub fn step_over_breakpoint(&self) {
-        todo!()
+    pub fn step_over_breakpoint(&mut self) {
+        let breakpoint_addr = self.get_pc() - 1;
+        let breakpoint = self.breakpoints.get_mut(&breakpoint_addr);
+        match breakpoint {
+            Some(b) => {
+                let ptr = b as *mut BreakPoint;
+                if b.enabled {
+                    b.disable();
+                    unsafe {
+                        ptrace(libc::PTRACE_SINGLESTEP, self.prog_pid, 0, 0);
+                        self.wait_for_signal();
+                        // SAFETY: it' under control
+                        (*(&mut *ptr)).enable();
+                    }
+                }
+            }
+            None => {}
+        }
     }
 
     pub fn handle_command(&mut self, comm: &str) {
@@ -211,6 +268,8 @@ impl Debugger {
                 }
                 Gdb::Info { info } => self.handle_info(info),
                 Gdb::Quit => self.handle_quit(),
+                Gdb::Enable { index } => self.handle_enable(index),
+                Gdb::Disable { index } => self.handle_disable(index),
                 Gdb::Memory { memory } => self.handle_memory(memory),
                 _ => {}
             },
@@ -243,12 +302,30 @@ impl Debugger {
     }
 
     pub fn handle_breakpoint(&mut self, addr: String) {
-        let addr = str_to_usize(&addr);
+        let addr = str_to_u64(&addr);
         match addr {
             Ok(addr) => {
                 self.set_breakpointer_at_address(addr);
             }
             Err(er) => println!("unknown type of address: {:?}", addr),
+        }
+    }
+
+    pub fn handle_enable(&mut self, index: usize) {
+        if let Some(addr) = self.index_to_breakpoints.get(&index) {
+            let breakpoint = self.breakpoints.get_mut(addr).unwrap();
+            breakpoint.enable();
+        } else {
+            println!("no breakpoint of index {:?}", index);
+        }
+    }
+
+    pub fn handle_disable(&mut self, index: usize) {
+        if let Some(addr) = self.index_to_breakpoints.get(&index) {
+            let breakpoint = self.breakpoints.get_mut(addr).unwrap();
+            breakpoint.disable();
+        } else {
+            println!("no breakpoint of index {:?}", index);
         }
     }
 
@@ -299,8 +376,18 @@ impl Debugger {
         }
     }
 
-    pub fn handle_sigtrap(&mut self) {
-        todo!()
+    pub fn handle_sigtrap(&mut self, info: i32) {
+        match info {
+            TRAP_BRKPT => {
+                let current_pc = self.get_pc();
+                self.set_pc(current_pc - 1);
+                println!("Hit breakpoint at address: {:?}", current_pc);
+            }
+            TRAP_TRACE => {}
+            _ => {
+                println!("unimplemented of sigtrap code:{}", info);
+            }
+        }
     }
 
     // ====== memory
@@ -320,24 +407,14 @@ impl Debugger {
     // signal handle at the very beginning
     pub fn wait_for_signal(&mut self) {
         unsafe {
-            let mut wait_status = 0;
-            let option = 0;
-            libc::waitpid(self.prog_pid, &mut wait_status as _, option);
-            dbg!(wait_status);
-
-            let mut info = 0;
-            libc::ptrace(
-                libc::PTRACE_GETSIGINFO,
-                self.prog_pid,
-                0,
-                &mut info as *mut _ as *mut libc::c_void,
-            );
+            dbg!(self.wait_signal_info());
+            let info = dbg!(self.get_signal_info());
 
             match info {
-                libc::SIGSEGV => {
-                    self.handle_sigtrap();
-                }
                 libc::SIGTRAP => {
+                    self.handle_sigtrap(info);
+                }
+                libc::SIGSEGV => {
                     println!("catch segfault. Reason: {}", info);
                 }
                 _ => {
@@ -347,9 +424,31 @@ impl Debugger {
         }
     }
 
+    pub fn get_signal_info(&self) -> i32 {
+        unsafe {
+            let mut info = 0;
+            libc::ptrace(
+                libc::PTRACE_GETSIGINFO,
+                self.prog_pid,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+            );
+
+            info
+        }
+    }
+
+    pub fn wait_signal_info(&self) -> i32 {
+        let mut wait_status = 0;
+        let option = 0;
+        unsafe { libc::waitpid(self.prog_pid, &mut wait_status as _, option) }
+    }
+
+    #[cfg(not(mock))]
     pub fn run(&mut self) {
         let state = &mut self.state;
         *state = State::Running;
+        self.initialize_load_addr();
         let mut rl = Editor::<()>::new();
         if rl.load_history(".gdbrs.history").is_err() {
             println!("No previous history.");
@@ -383,6 +482,11 @@ impl Debugger {
             }
         }
         rl.save_history(".gdbrs.history").unwrap();
+    }
+
+    #[cfg(mock)]
+    pub fn run(&mut self) {
+        todo!();
     }
 }
 
