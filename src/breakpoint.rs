@@ -1,5 +1,7 @@
 use libc::pid_t;
 
+use crate::utils::i64_to_u8s;
+
 #[derive(Clone, Debug)]
 pub struct BreakPoint {
     pub pid: pid_t,
@@ -22,6 +24,11 @@ impl BreakPoint {
         unsafe {
             let data = libc::ptrace(libc::PTRACE_PEEKDATA, self.pid, self.addr, 0);
             self.saved_data = data;
+            println!(
+                "raw data of i64:{}, u8 array format:{:x?}",
+                data,
+                &(i64_to_u8s(data)[..])
+            );
             let data_with_int3 = (data & !0xff) | 0xcc; // set the lower byte into 0xcc
             libc::ptrace(libc::PTRACE_POKEDATA, self.pid, self.addr, data_with_int3);
         }
@@ -35,5 +42,13 @@ impl BreakPoint {
             libc::ptrace(libc::PTRACE_POKEDATA, self.pid, self.addr, restored_data);
         }
         self.enabled = false;
+    }
+}
+
+impl Drop for BreakPoint {
+    fn drop(&mut self) {
+        if self.enabled {
+            self.disable();
+        }
     }
 }
