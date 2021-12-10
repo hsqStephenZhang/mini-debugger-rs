@@ -218,8 +218,13 @@ impl Debugger {
         }
     }
 
-    pub fn single_step_instructions_with_breakpoint_check(&mut self) {
-        todo!()
+    pub fn single_step_instruction_with_breakpoint_check(&mut self) {
+        let pc = self.get_pc();
+        if let Some(v) = self.breakpoints.get(&pc) {
+            self.step_over_breakpoint();
+        } else {
+            self.single_step_instruction();
+        }
     }
 
     pub fn step_in(&mut self) {
@@ -295,7 +300,7 @@ impl Debugger {
                 Gdb::Enable { index } => self.handle_enable(index),
                 Gdb::Disable { index } => self.handle_disable(index),
                 Gdb::Memory { memory } => self.handle_memory(memory),
-                Gdb::Stepi => self.single_step_instruction(),
+                Gdb::Stepi => self.single_step_instruction_with_breakpoint_check(),
                 _ => {}
             },
             Err(e) => {
@@ -414,18 +419,18 @@ impl Debugger {
     }
 
     // when we hit a breakpoint, the instruction and pc display like:
-    //     
+    //
     // original instruction:
     //         55          push %rbp
-    //         48 89 e5    mov  %rsp,%rbp 
+    //         48 89 e5    mov  %rsp,%rbp
     //
     // hooked instruction:
     //         cc          int3
-    // pc->    48 89 e5    mov  %rsp,%rbp     
+    // pc->    48 89 e5    mov  %rsp,%rbp
 
     // we now set the pc to:
     // pc->    cc          int3
-    //         48 89 e5    mov  %rsp,%rbp 
+    //         48 89 e5    mov  %rsp,%rbp
     pub fn handle_sigtrap(&mut self, info: siginfo_t) {
         let registers = dbg!(self.get_registers());
         match info.si_code {

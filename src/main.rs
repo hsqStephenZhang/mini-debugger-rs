@@ -7,6 +7,7 @@ use crate::debugger::Debugger;
 pub mod breakpoint;
 pub mod command;
 pub mod debugger;
+pub mod addr2line;
 pub mod utils;
 
 fn main() {
