@@ -14,7 +14,7 @@ structopt = { version = "0.3", default-features = false }
 clap = "2.*"
 
 # elf and dwarf
-goblin = "0.4"
+object = "0.27"
 gimli = "0.26"
 regex = "1"
 typed-arena = "2.0"
