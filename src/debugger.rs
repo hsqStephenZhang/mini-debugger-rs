@@ -211,8 +211,11 @@ impl Debugger {
 
     // ====== debug related functions
 
-    pub fn single_step_instructions(&mut self) {
-        todo!()
+    pub fn single_step_instruction(&mut self) {
+        unsafe {
+            ptrace(libc::PTRACE_SINGLESTEP, self.prog_pid, 0, 0);
+            self.wait_for_signal();
+        }
     }
 
     pub fn single_step_instructions_with_breakpoint_check(&mut self) {
@@ -237,8 +240,9 @@ impl Debugger {
     //      3. waitpid, handle the sigtrap
     //      4. enable the breakpoint
     pub fn step_over_breakpoint(&mut self) {
-        let breakpoint_addr = self.get_pc();
-        dbg!(breakpoint_addr, &self.breakpoints);
+        let registers = self.get_registers();
+        let breakpoint_addr = registers.rip;
+        dbg!(&registers, &self.breakpoints);
         let breakpoint = self.breakpoints.get_mut(&breakpoint_addr);
         match breakpoint {
             Some(b) => {
@@ -255,7 +259,7 @@ impl Debugger {
                 }
             }
             None => {
-                println!("no breakpoint!!!!!");
+                println!("no breakpoint here, just execute until next breakpoint");
             }
         }
     }
@@ -291,6 +295,7 @@ impl Debugger {
                 Gdb::Enable { index } => self.handle_enable(index),
                 Gdb::Disable { index } => self.handle_disable(index),
                 Gdb::Memory { memory } => self.handle_memory(memory),
+                Gdb::Stepi => self.single_step_instruction(),
                 _ => {}
             },
             Err(e) => {
@@ -408,6 +413,19 @@ impl Debugger {
         }
     }
 
+    // when we hit a breakpoint, the instruction and pc display like:
+    //     
+    // original instruction:
+    //         55          push %rbp
+    //         48 89 e5    mov  %rsp,%rbp 
+    //
+    // hooked instruction:
+    //         cc          int3
+    // pc->    48 89 e5    mov  %rsp,%rbp     
+
+    // we now set the pc to:
+    // pc->    cc          int3
+    //         48 89 e5    mov  %rsp,%rbp 
     pub fn handle_sigtrap(&mut self, info: siginfo_t) {
         let registers = dbg!(self.get_registers());
         match info.si_code {
