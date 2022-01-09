@@ -38,7 +38,7 @@ pub enum Symbol {
     File,
 }
 
-pub struct Debugger {
+pub struct Debugger<'a> {
     pub state: State,
     pub prog_name: String,
     pub prog_pid: pid_t,
@@ -46,12 +46,12 @@ pub struct Debugger {
     pub breakpoints: HashMap<u64, BreakPoint>,
     pub index_to_breakpoints: HashMap<usize, u64>,
     pub next_breakpoint_index: usize,
+    pub obj_file: object::File<'a>,
 }
 
 #[allow(warnings)]
-impl Debugger {
-    // TODO: read the proc file, set the load addr
-    pub fn new(prog_name: String, prog_pid: pid_t) -> Self {
+impl<'a> Debugger<'a> {
+    pub fn new(prog_name: String, prog_pid: pid_t, ojb_file: object::File<'a>) -> Self {
         Self {
             state: State::NotRunning,
             prog_name,
@@ -60,12 +60,34 @@ impl Debugger {
             breakpoints: HashMap::new(),
             index_to_breakpoints: HashMap::new(),
             next_breakpoint_index: 0,
+            obj_file: ojb_file,
         }
     }
 
     pub fn set_state(&mut self, state: State) {
         let s = &mut self.state;
         *s = state;
+    }
+
+    pub fn print_source(&self, location: &addr2line::Location) {
+        if let (Some(filename), Some(line_num)) = (location.file, location.line) {
+            info!("reading source file:{:?}, line: {:?}", filename, line_num,);
+            match crate::utils::read_lines(filename) {
+                Ok(lines) => {
+                    for (idx, line) in lines
+                        .into_iter()
+                        .enumerate()
+                        .skip(line_num as usize)
+                        .take(10)
+                    {
+                        println!("{}: {}", idx, line.unwrap());
+                    }
+                }
+                Err(e) => println!("read source file err: {:?}", e),
+            }
+        } else {
+            warn!("source file content not found");
+        }
     }
 
     pub fn initialize_load_addr(&mut self) {
@@ -77,7 +99,7 @@ impl Debugger {
         let base_addr = items[0];
         let addr = usize::from_str_radix(base_addr, 16).unwrap();
         self.load_addr = addr;
-        println!("load addr:{:x?}", self.load_addr);
+        info!("load addr: 0x{:x?}", self.load_addr);
     }
 
     pub fn set_breakpointer_at_address(&mut self, addr: u64) {
@@ -114,11 +136,11 @@ impl Debugger {
         }
     }
 
-    pub fn name_to_register<'a>(
+    pub fn name_to_register<'b>(
         &self,
-        registers: &'a mut libc::user_regs_struct,
+        registers: &'b mut libc::user_regs_struct,
         name: &str,
-    ) -> Option<&'a mut libc::c_ulonglong> {
+    ) -> Option<&'b mut libc::c_ulonglong> {
         return match name {
             "r15" => Some(&mut registers.r14),
             "r14" => Some(&mut registers.r13),
@@ -198,10 +220,6 @@ impl Debugger {
     }
 
     pub fn print_backtrace(&self) {
-        todo!()
-    }
-
-    pub fn print_source(&self) {
         todo!()
     }
 
@@ -324,7 +342,7 @@ impl Debugger {
     pub fn handle_quit(&mut self) {
         match self.state {
             State::Running => {
-                println!("debugger is running, do you want to close is?(yes for close, other for cancel)");
+                println!("debugger is running, do you want to close is? (y/Y for close, other for cancel)");
                 let mut buffer = String::new();
                 let r = std::io::stdin().read_line(&mut buffer).unwrap();
                 let content = buffer.trim().trim_end();
@@ -437,6 +455,14 @@ impl Debugger {
             TRAP_BRKPT | SI_KERNEL => {
                 let current_pc = registers.rip;
                 self.set_pc(current_pc - 1);
+                let ctx = addr2line::Context::new(&self.obj_file).unwrap();
+                let res = ctx.find_location(current_pc - 1 - self.load_addr as u64);
+                if let (Ok(Some(location))) = res {
+                    self.print_source(&location);
+                } else {
+                    warn!("cannot find debug source file");
+                }
+
                 println!("Hit breakpoint at address: {:?}", current_pc);
             }
             TRAP_TRACE => {}
@@ -545,4 +571,20 @@ fn tokens(input: &str) -> Vec<&str> {
         .map(|s| s.trim().trim_end())
         .filter(|&v| v != "")
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn t1() {
+        let bin_data = std::fs::read("data/test").unwrap();
+        let obj_file = object::File::parse(&*bin_data).unwrap();
+        let ctx = addr2line::Context::new(&obj_file).unwrap();
+        let _location = ctx
+            .find_location(0x114b)
+            // .find_location(dbg!(current_pc - 1 - self.load_addr as u64))
+            .unwrap()
+            .unwrap();
+    }
 }

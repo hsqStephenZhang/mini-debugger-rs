@@ -1,16 +1,20 @@
+use libc::fork;
+use std::fs;
 use std::{ffi::CString, process::exit};
 
-use libc::fork;
+#[macro_use]
+extern crate log;
+extern crate simple_logger;
 
 use crate::debugger::Debugger;
 
 pub mod breakpoint;
 pub mod command;
 pub mod debugger;
-pub mod addr2line;
 pub mod utils;
 
 fn main() {
+    simple_logger::init_with_level(log::Level::Info).unwrap();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         println!("no program specified");
@@ -26,7 +30,9 @@ fn main() {
             execute_debuggee(&prog);
         } else if pid >= 1 {
             println!("starting debugger process");
-            let mut debugger = Debugger::new(prog, pid);
+            let bin_data = fs::read(prog.clone()).expect("read object file failed");
+            let obj_file = object::File::parse(&*bin_data).expect("parse object content failed");
+            let mut debugger = Debugger::new(prog, pid, obj_file);
 
             match debugger.wait_for_signal() {
                 Ok(_) => debugger.run(),
