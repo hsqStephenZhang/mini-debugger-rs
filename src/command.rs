@@ -4,6 +4,7 @@ use structopt::StructOpt;
 #[structopt(about = "Gdb-rs commands")]
 pub enum Gdb {
     Quit,
+    Backtrace,
     // break point related commands
     Break {
         addr: String,
@@ -13,6 +14,9 @@ pub enum Gdb {
     },
     Disable {
         index: usize,
+    },
+    Disassemble {
+        addr: Option<String>,
     },
     // debug utils
     Continue,

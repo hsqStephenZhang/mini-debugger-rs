@@ -11,6 +11,7 @@ use crate::debugger::Debugger;
 pub mod breakpoint;
 pub mod command;
 pub mod debugger;
+pub mod expr;
 pub mod utils;
 
 fn main() {
@@ -48,8 +49,7 @@ unsafe fn execute_debuggee(prog: &str) {
         println!("error in ptrace");
     }
 
-    dbg!(r);
-
+    // dbg!(r);
     let prog_ctr = CString::new(prog).unwrap();
     libc::execl(prog_ctr.as_ptr(), prog_ctr.as_ptr(), 0);
 }

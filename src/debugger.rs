@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{self, BufRead},
+    rc::Rc,
 };
 
 use libc::{pid_t, ptrace, siginfo_t};
@@ -69,16 +70,20 @@ impl<'a> Debugger<'a> {
         *s = state;
     }
 
-    pub fn print_source(&self, location: &addr2line::Location) {
-        if let (Some(filename), Some(line_num)) = (location.file, location.line) {
-            info!("reading source file:{:?}, line: {:?}", filename, line_num,);
+    fn offset_loadaddr(&self, cur: u64) -> u64 {
+        cur - self.load_addr as u64
+    }
+
+    pub fn print_source(&self, location: &addr2line::Location, num_lines: usize) {
+        if let (Some(filename), Some(line_idx)) = (location.file, location.line) {
+            info!("reading source file:{:?}, line: {:?}", filename, line_idx);
             match crate::utils::read_lines(filename) {
                 Ok(lines) => {
                     for (idx, line) in lines
                         .into_iter()
                         .enumerate()
-                        .skip(line_num as usize)
-                        .take(10)
+                        .skip(line_idx as usize - 1)
+                        .take(num_lines)
                     {
                         println!("{}: {}", idx, line.unwrap());
                     }
@@ -189,6 +194,12 @@ impl<'a> Debugger<'a> {
         }
     }
 
+    pub fn set_registers(&self, mut registers: libc::user_regs_struct) {
+        let p = &mut registers as *mut _ as *mut libc::c_void;
+        unsafe {
+            ptrace(libc::PTRACE_SETREGS, self.prog_pid, 0, p);
+        }
+    }
     pub fn set_register(&self, name: &str, value: u64) {
         let mut registers = self.get_registers();
         match self.name_to_register(&mut registers, name) {
@@ -202,13 +213,6 @@ impl<'a> Debugger<'a> {
         }
     }
 
-    pub fn set_registers(&self, mut registers: libc::user_regs_struct) {
-        let p = &mut registers as *mut _ as *mut libc::c_void;
-        unsafe {
-            ptrace(libc::PTRACE_SETREGS, self.prog_pid, 0, p);
-        }
-    }
-
     pub fn get_pc(&self) -> u64 {
         self.get_registers().rip
     }
@@ -217,14 +221,6 @@ impl<'a> Debugger<'a> {
         let mut registers = self.get_registers();
         registers.rip = pc;
         self.set_registers(registers);
-    }
-
-    pub fn print_backtrace(&self) {
-        todo!()
-    }
-
-    pub fn lookup_symbol(&self) {
-        todo!()
     }
 
     // ====== debug related functions
@@ -265,7 +261,7 @@ impl<'a> Debugger<'a> {
     pub fn step_over_breakpoint(&mut self) {
         let registers = self.get_registers();
         let breakpoint_addr = registers.rip;
-        dbg!(&registers, &self.breakpoints);
+        // dbg!(&registers, &self.breakpoints);
         let breakpoint = self.breakpoints.get_mut(&breakpoint_addr);
         match breakpoint {
             Some(b) => {
@@ -307,23 +303,75 @@ impl<'a> Debugger<'a> {
 
         match parsed {
             Ok(gdb) => match gdb {
-                Gdb::Continue => {
-                    self.handle_continue();
+                Gdb::Backtrace => {
+                    self.handle_backtrace();
                 }
                 Gdb::Break { addr } => {
                     self.handle_breakpoint(addr);
                 }
-                Gdb::Info { info } => self.handle_info(info),
-                Gdb::Quit => self.handle_quit(),
+                Gdb::Continue => {
+                    self.handle_continue();
+                }
                 Gdb::Enable { index } => self.handle_enable(index),
                 Gdb::Disable { index } => self.handle_disable(index),
+                Gdb::Disassemble { addr } => self.handle_disassemble(addr),
+                Gdb::Info { info } => self.handle_info(info),
                 Gdb::Memory { memory } => self.handle_memory(memory),
+                Gdb::Quit => self.handle_quit(),
                 Gdb::Stepi => self.single_step_instruction_with_breakpoint_check(),
                 _ => {}
             },
             Err(e) => {
                 println!("error:{:}", e);
             }
+        }
+    }
+
+    pub fn handle_backtrace(&self) {
+        let mut frame_number = 0;
+
+        let mut frame_dumper = |func_name: addr2line::FunctionName<
+            gimli::EndianReader<gimli::RunTimeEndian, Rc<[u8]>>,
+        >,
+                                func_location: addr2line::Location| {
+            frame_number += 1;
+
+            println!(
+                "frame #{}, {:?} at {} line {}",
+                frame_number,
+                func_name.raw_name().unwrap(),
+                func_location.file.unwrap_or(""),
+                func_location.line.unwrap_or(0)
+            );
+        };
+
+        let pc = self.offset_loadaddr(self.get_pc());
+        let ctx = addr2line::Context::new(&self.obj_file).unwrap();
+        let res = ctx.find_frames(pc);
+        let unit = ctx.find_dwarf_unit(pc).unwrap();
+        match res {
+            Ok(mut frame_iter) => {
+                while let Ok(Some(f)) = frame_iter.next() {
+                    let func_name = f.function;
+                    let func_location = f.location;
+                    if let (Some(func_name), Some(func_location)) = (func_name, func_location) {
+                        frame_dumper(func_name, func_location);
+                    }
+                }
+            }
+            err => {
+                warn!("no backtrace at this position, pc={}", pc);
+            }
+        }
+    }
+
+    pub fn handle_breakpoint(&mut self, addr: String) {
+        let addr = str_to_u64(&addr);
+        match addr {
+            Ok(addr) => {
+                self.set_breakpointer_at_address(addr);
+            }
+            Err(er) => println!("unknown type of address: {:?}", addr),
         }
     }
 
@@ -339,35 +387,30 @@ impl<'a> Debugger<'a> {
         }
     }
 
-    pub fn handle_quit(&mut self) {
-        match self.state {
-            State::Running => {
-                println!("debugger is running, do you want to close is? (y/Y for close, other for cancel)");
-                let mut buffer = String::new();
-                let r = std::io::stdin().read_line(&mut buffer).unwrap();
-                let content = buffer.trim().trim_end();
-                match content.to_lowercase().as_str() {
-                    "yes" | "y" => {
-                        let mut state = &mut self.state;
-                        *state = State::Closed;
-                    }
-                    _ => {}
-                }
-            }
-            _ => {
-                let mut state = &mut self.state;
-                *state = State::Closed;
-            }
+    pub fn handle_disable(&mut self, index: usize) {
+        if let Some(addr) = self.index_to_breakpoints.get(&index) {
+            let breakpoint = self.breakpoints.get_mut(addr).unwrap();
+            breakpoint.disable();
+        } else {
+            println!("no breakpoint of index {:?}", index);
         }
     }
 
-    pub fn handle_breakpoint(&mut self, addr: String) {
-        let addr = str_to_u64(&addr);
+    // TODO: use addr
+    pub fn handle_disassemble(&mut self, addr: Option<String>) {
+        let ctx = addr2line::Context::new(&self.obj_file).unwrap();
+
         match addr {
-            Ok(addr) => {
-                self.set_breakpointer_at_address(addr);
+            None => {
+                let pc_offset = self.offset_loadaddr(self.get_pc());
+                let res = ctx.find_location(pc_offset);
+                if let Ok(Some(location)) = res {
+                    self.print_source(&location, 10);
+                }
             }
-            Err(er) => println!("unknown type of address: {:?}", addr),
+            Some(addr) => {
+                unimplemented!()
+            }
         }
     }
 
@@ -375,15 +418,6 @@ impl<'a> Debugger<'a> {
         if let Some(addr) = self.index_to_breakpoints.get(&index) {
             let breakpoint = self.breakpoints.get_mut(addr).unwrap();
             breakpoint.enable();
-        } else {
-            println!("no breakpoint of index {:?}", index);
-        }
-    }
-
-    pub fn handle_disable(&mut self, index: usize) {
-        if let Some(addr) = self.index_to_breakpoints.get(&index) {
-            let breakpoint = self.breakpoints.get_mut(addr).unwrap();
-            breakpoint.disable();
         } else {
             println!("no breakpoint of index {:?}", index);
         }
@@ -450,15 +484,15 @@ impl<'a> Debugger<'a> {
     // pc->    cc          int3
     //         48 89 e5    mov  %rsp,%rbp
     pub fn handle_sigtrap(&mut self, info: siginfo_t) {
-        let registers = dbg!(self.get_registers());
+        let registers = self.get_registers();
         match info.si_code {
             TRAP_BRKPT | SI_KERNEL => {
                 let current_pc = registers.rip;
                 self.set_pc(current_pc - 1);
                 let ctx = addr2line::Context::new(&self.obj_file).unwrap();
-                let res = ctx.find_location(current_pc - 1 - self.load_addr as u64);
+                let res = ctx.find_location(self.offset_loadaddr(current_pc - 1));
                 if let (Ok(Some(location))) = res {
-                    self.print_source(&location);
+                    self.print_source(&location, 10);
                 } else {
                     warn!("cannot find debug source file");
                 }
@@ -467,10 +501,33 @@ impl<'a> Debugger<'a> {
             }
             TRAP_TRACE => {}
             _ => {
-                println!("unimplemented of sigtrap code: {:?}", info);
+                warn!("unimplemented of sigtrap code: {:?}", info);
             }
         }
     }
+
+    pub fn handle_quit(&mut self) {
+        match self.state {
+            State::Running => {
+                println!("debugger is running, do you want to close is? (y/Y for close, other for cancel)");
+                let mut buffer = String::new();
+                let r = std::io::stdin().read_line(&mut buffer).unwrap();
+                let content = buffer.trim().trim_end();
+                match content.to_lowercase().as_str() {
+                    "yes" | "y" => {
+                        let mut state = &mut self.state;
+                        *state = State::Closed;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {
+                let mut state = &mut self.state;
+                *state = State::Closed;
+            }
+        }
+    }
+
 
     // ====== memory
     pub fn read_memory(&self, addr: usize) -> i64 {
@@ -519,7 +576,6 @@ impl<'a> Debugger<'a> {
         unsafe { libc::waitpid(self.prog_pid, &mut wait_status as _, option) }
     }
 
-    #[cfg(not(mock))]
     pub fn run(&mut self) {
         let state = &mut self.state;
         *state = State::Running;
@@ -558,11 +614,6 @@ impl<'a> Debugger<'a> {
         }
         rl.save_history(".gdbrs.history").unwrap();
     }
-
-    #[cfg(mock)]
-    pub fn run(&mut self) {
-        todo!();
-    }
 }
 
 fn tokens(input: &str) -> Vec<&str> {
@@ -586,5 +637,17 @@ mod tests {
             // .find_location(dbg!(current_pc - 1 - self.load_addr as u64))
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn t2() {
+        let bin_data = std::fs::read("data/test").unwrap();
+        let obj_file = object::File::parse(&*bin_data).unwrap();
+        let ctx = addr2line::Context::new(&obj_file).unwrap();
+        let res = ctx
+            .find_dwarf_unit(0x114b)
+            // .find_location(dbg!(current_pc - 1 - self.load_addr as u64))
+            .unwrap();
+        dbg!(res);
     }
 }
