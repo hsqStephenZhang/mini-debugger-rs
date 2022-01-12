@@ -24,3 +24,5 @@ memmap = "0.7"
 addr2line = "0.17.0"
 log = "0.4"
 simple_logger = "0.5"
+
+iced-x86 = "1.15.0"

@@ -12,6 +12,9 @@ pub enum Gdb {
     Enable {
         index: usize,
     },
+    Delete {
+        index: usize,
+    },
     Disable {
         index: usize,
     },
@@ -20,18 +23,22 @@ pub enum Gdb {
     },
     // debug utils
     Continue,
-    Step,
-    Next,
-    Stepi,
-    Nexti,
-    Memory {
-        #[structopt(subcommand)]
-        memory: Memory,
-    },
+    Finish,
     Info {
         #[structopt(subcommand)]
         info: Info,
     },
+    Memory {
+        #[structopt(subcommand)]
+        memory: Memory,
+    },
+    Next,
+    Nexti,
+    Source {
+        addr: Option<String>,
+    },
+    Step,
+    Stepi,
 }
 
 #[derive(StructOpt, Debug, Clone, PartialEq, Eq)]
@@ -48,6 +55,7 @@ pub enum Info {
     Breakpoints,
     Registers,
     Register { name: Option<String> },
+    Line { name: String}
 }
 
 pub fn into_gdb(args: Vec<&str>) -> Result<Gdb, clap::Error> {
