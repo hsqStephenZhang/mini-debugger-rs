@@ -55,7 +55,8 @@ pub enum Info {
     Breakpoints,
     Registers,
     Register { name: Option<String> },
-    Line { name: String}
+    Line { name: String},
+    Var { name: String}
 }
 
 pub fn into_gdb(args: Vec<&str>) -> Result<Gdb, clap::Error> {

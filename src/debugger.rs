@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{self, BufRead},
+    path::PathBuf,
 };
 
 use iced_x86::{Formatter, NasmFormatter};
@@ -14,7 +15,7 @@ use rustyline::{error::ReadlineError, Editor};
 use crate::{
     breakpoint::BreakPoint,
     command::{Gdb, Info, Memory},
-    utils::{str_to_u64, str_to_usize},
+    utils::{to_absolute_path, str_to_u64, str_to_usize},
 };
 
 pub const TRAP_BRKPT: i32 = 1; /* process breakpoint */
@@ -158,20 +159,29 @@ impl<'a> Debugger<'a> {
         }
     }
 
-    pub fn set_breakpointer_at_source_line(
-        &mut self,
-        filename: Option<&str>,
-        line_offset: Option<u32>,
-    ) {
+    pub fn set_breakpointer_at_source_line(&mut self, filename: &str, line_offset: u32) {
+        let pathbuf = PathBuf::from(filename);
+        let path = pathbuf.as_path();
+        let absolute_filename = to_absolute_path(path).unwrap();
+        let absolute_filename= absolute_filename.to_str().unwrap();
         let ctx = addr2line::Context::new(&self.obj_file).unwrap();
+        // we will search the whole source file
         let mut res = ctx.find_location_range(0, u64::MAX).unwrap();
         while let Some((addr, len, location)) = res.next() {
             let addr2line::Location { file, line, column } = location;
-            if file == filename && line == line_offset {
-                self.set_breakpointer_at_address(addr + self.load_addr as u64);
-                return;
+            if let (Some(file), Some(line)) = (file, line) {
+                if file == absolute_filename && line == line_offset {
+                    self.set_breakpointer_at_address(addr + self.load_addr as u64);
+                    return;
+                } else {
+                    // warn!("filename {:?} at line {:?} not match", file, line.unwrap());
+                }
             }
         }
+        warn!(
+            "filename {:?} at line {:?} not match",
+            absolute_filename, line_offset
+        );
     }
 
     pub fn dump_breakpoints(&self) {
@@ -183,8 +193,8 @@ impl<'a> Debugger<'a> {
                 "disabled"
             };
             println!(
-                "{:<5}: 0x{:x?}, status:{}, saved data:0x{:x?}",
-                index, breakpoint.addr, status, breakpoint.saved_data
+                "NO.:{:<5}, addr: 0x{:x?}, status:{}",
+                index, breakpoint.addr, status
             );
         }
     }
@@ -460,22 +470,25 @@ impl<'a> Debugger<'a> {
             // 1. find current line
             let location = ctx.find_location(pc);
             if let Ok(Some(loc)) = location {
-                let filename = loc.file;
+                let filename = loc.file.unwrap();
                 let line = loc.line.unwrap();
                 // 2. parse the line offset
                 let offset = addr.parse::<i64>();
+                info!(
+                    "filename:{:#?}, line:{:#?}, offset:{:#?}",
+                    filename, line, offset
+                );
                 match offset {
                     Ok(res) => {
                         // 3. get the real line number
                         let line_idx = (line as i64 + res) as u32;
-                        self.set_breakpointer_at_source_line(filename, Some(line_idx))
+                        self.set_breakpointer_at_source_line(filename, line_idx)
                     }
                     Err(err) => {
                         warn!("error parsing line offset");
                     }
                 }
             }
-
             return;
         }
 
@@ -484,9 +497,10 @@ impl<'a> Debugger<'a> {
             if strings.len() == 2 {
                 let r = strings[1].parse::<u32>();
                 if let Ok(line) = r {
-                    self.set_breakpointer_at_source_line(Some(strings[0]), Some(line));
+                    self.set_breakpointer_at_source_line(strings[0], line);
                 }
             }
+            return;
         }
 
         if let Some(sym) = self.lookup_symbol(&addr) {
@@ -495,6 +509,7 @@ impl<'a> Debugger<'a> {
                 let addr = sym.address() + self.load_addr as u64;
                 self.set_breakpointer_at_address(addr);
             }
+            return;
         }
     }
 
@@ -548,6 +563,10 @@ impl<'a> Debugger<'a> {
         };
         let symbol = self.lookup_symbol(&name);
         if let Some(sym) = symbol {
+            if sym.kind() != object::SymbolKind::Text {
+                println!("symbol is not a function");
+                return;
+            }
             let addr = sym.address();
             let size = sym.size();
 
@@ -608,6 +627,10 @@ impl<'a> Debugger<'a> {
             }
             Info::Line { name } => {
                 if let Some(symbol) = self.lookup_symbol(&name) {
+                    if symbol.kind() != object::SymbolKind::Text {
+                        println!("symbol is not a function");
+                        return;
+                    }
                     let addr = symbol.address();
                     let size = symbol.size();
                     println!(
@@ -617,7 +640,19 @@ impl<'a> Debugger<'a> {
                         addr + size
                     );
                 } else {
-                    println!("Function \"{}\" not defined", name)
+                    println!("Symbol \"{}\" not defined", name)
+                }
+            }
+            Info::Var { name } => {
+                if let Some(symbol) = self.lookup_symbol(&name) {
+                    if symbol.kind() != object::SymbolKind::Data {
+                        println!("symbol is not a variable");
+                        return;
+                    }
+                    let addr = symbol.address();
+                    println!("\"{}\" starts at 0x{:x}", name, addr);
+                } else {
+                    println!("Symbol \"{}\" not defined", name)
                 }
             }
         }
@@ -632,7 +667,7 @@ impl<'a> Debugger<'a> {
                 let new_res = ctx.find_location(self.offset_loadaddr(self.get_pc()));
                 if let Ok(Some(new_loc)) = new_res {
                     if loc.file == new_loc.file && loc.line == new_loc.line {
-                        self.print_source_raw(loc.file.unwrap(), loc.line.unwrap() - 1, 1);
+                        self.print_source_raw(loc.file.unwrap(), loc.line.unwrap() as usize - 1, 1);
                         continue;
                     }
                 }
@@ -700,7 +735,7 @@ impl<'a> Debugger<'a> {
     pub fn handle_quit(&mut self) {
         match self.state {
             State::Running => {
-                println!("debugger is running, do you want to close is? (y/Y for close, other for cancel)");
+                print!("debugger is running, do you want to close is? (y/Y for close, other for cancel):");
                 let mut buffer = String::new();
                 let r = std::io::stdin().read_line(&mut buffer).unwrap();
                 let content = buffer.trim().trim_end();
@@ -752,8 +787,8 @@ impl<'a> Debugger<'a> {
             TRAP_TRACE => {}
             _ => {
                 warn!(
-                    "unimplemented of sigtrap code: signo: 0x{:x?}, errno: 0x{:x?}",
-                    info.si_signo, info.si_errno
+                    "unimplemented of sigtrap errno: 0x{:x?}, code: 0x{:x?}",
+                    info.si_errno, info.si_code
                 );
             }
         }

@@ -1,7 +1,9 @@
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, NasmFormatter};
 use std::fs::File;
 use std::io::{self, BufRead};
-use std::path::Path;
+use std::path::{PathBuf, Path};
+
+use path_clean::PathClean;
 
 pub fn str_to_usize(s: &str) -> Result<usize, &str> {
     if s.starts_with("0x") {
@@ -61,6 +63,20 @@ pub(crate) fn disassemble(bytes: &[u8], code_bitness: u32, rip: u64, column_byte
         }
         println!(" {}", output);
     }
+}
+
+
+
+pub fn to_absolute_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let path = path.as_ref();
+
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    }.clean();
+
+    Ok(absolute_path)
 }
 
 #[cfg(test)]
